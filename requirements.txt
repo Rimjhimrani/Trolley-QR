@@ -2,4 +2,7 @@ streamlit
 qrcode 
 openpyxl 
 pillow 
-pandas
+pandas 
+google-auth 
+google-auth-oauthlib g
+oogle-api-python-client
