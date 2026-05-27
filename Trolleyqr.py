@@ -11,6 +11,114 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# ─── Google Sheets Integration ──────────────────────────────────────────────────
+# Install: pip install gspread google-auth
+import gspread
+from google.oauth2.service_account import Credentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# ── GSheets helpers ────────────────────────────────────────────────────────────
+
+@st.cache_resource
+def get_gsheet_client():
+    """
+    Authenticate using service account credentials stored in Streamlit secrets.
+    In secrets.toml add:
+
+        [gcp_service_account]
+        type = "service_account"
+        project_id = "..."
+        private_key_id = "..."
+        private_key = "-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----\\n"
+        client_email = "...@....iam.gserviceaccount.com"
+        client_id = "..."
+        auth_uri = "https://accounts.google.com/o/oauth2/auth"
+        token_uri = "https://oauth2.googleapis.com/token"
+        auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+        client_x509_cert_url = "..."
+    """
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        return None
+
+
+def get_spreadsheet():
+    """Open or create the master spreadsheet."""
+    client = get_gsheet_client()
+    if client is None:
+        return None
+    spreadsheet_name = st.secrets.get("spreadsheet_name", "TrolleyQRManager")
+    try:
+        sh = client.open(spreadsheet_name)
+    except gspread.SpreadsheetNotFound:
+        sh = client.create(spreadsheet_name)
+        sh.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
+    return sh
+
+
+def load_all_trolleys_from_sheets() -> dict:
+    """Load all trolley worksheets from Google Sheets into session state."""
+    sh = get_spreadsheet()
+    if sh is None:
+        return {}
+    trolleys = {}
+    for ws in sh.worksheets():
+        name = ws.title
+        if name == "Sheet1" and ws.row_count <= 1:
+            continue
+        try:
+            data = ws.get_all_records()
+            if data:
+                df = pd.DataFrame(data)
+                trolleys[name] = {"df": df, "filename": f"{name} (Google Sheets)"}
+        except Exception:
+            pass
+    return trolleys
+
+
+def save_trolley_to_sheets(trolley_name: str, df: pd.DataFrame):
+    """Save / overwrite a trolley worksheet in Google Sheets."""
+    sh = get_spreadsheet()
+    if sh is None:
+        st.warning("⚠️ Google Sheets not configured. Data saved in session only.")
+        return False
+
+    # Sanitise sheet name (max 100 chars, no special chars)
+    safe_name = trolley_name[:100]
+    try:
+        ws = sh.worksheet(safe_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=safe_name, rows=str(len(df) + 10), cols=str(len(df.columns) + 2))
+
+    # Write header + data
+    df_clean = df.fillna("").astype(str)
+    header = df_clean.columns.tolist()
+    rows = df_clean.values.tolist()
+    ws.update([header] + rows)
+    return True
+
+
+def delete_trolley_from_sheets(trolley_name: str):
+    """Delete a trolley worksheet from Google Sheets."""
+    sh = get_spreadsheet()
+    if sh is None:
+        return
+    try:
+        ws = sh.worksheet(trolley_name[:100])
+        sh.del_worksheet(ws)
+    except Exception:
+        pass
+
+
 # ─── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trolley QR Manager",
@@ -176,8 +284,13 @@ hr { border-color: var(--border) !important; }
 """
 
 # ─── Data Storage ────────────────────────────────────────────────────────────────
+# On first load, pull from Google Sheets so data persists across sessions
 if "trolleys" not in st.session_state:
-    st.session_state.trolleys = {}
+    with st.spinner("🔄 Loading trolley data from Google Sheets..."):
+        st.session_state.trolleys = load_all_trolleys_from_sheets()
+
+if "sheets_ok" not in st.session_state:
+    st.session_state.sheets_ok = get_gsheet_client() is not None
 
 EXPECTED_COLS = [
     "S.No", "Part No", "Description", "Store", "Zone",
@@ -188,36 +301,18 @@ EXPECTED_COLS = [
 
 # ─── Helper Functions ────────────────────────────────────────────────────────────
 
-def get_app_url() -> str:
-    """Get the base URL of this Streamlit app."""
-    try:
-        # Works on Streamlit Cloud
-        return st.get_option("browser.serverAddress") or "http://localhost:8501"
-    except Exception:
-        return "http://localhost:8501"
-
-
 def build_qr_url(trolley_name: str) -> str:
-    """
-    Build the URL that encodes the trolley pick list.
-    When deployed on Streamlit Cloud, this becomes the real hosted URL.
-    Workers scan this and the pick list opens directly in their browser.
-    """
-    # Try to get the actual deployed URL from headers
     try:
         headers = st.context.headers
         host = headers.get("host", "localhost:8501")
-        # Detect if running on HTTPS (Streamlit Cloud)
         proto = "https" if "streamlit.app" in host or "streamlitapp.com" in host else "http"
         base_url = f"{proto}://{host}"
     except Exception:
         base_url = "http://localhost:8501"
-    
     return f"{base_url}/?trolley={trolley_name}"
 
 
 def generate_qr_code(url: str, trolley_name: str) -> bytes:
-    """Generate a black & white QR code with label."""
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -226,7 +321,6 @@ def generate_qr_code(url: str, trolley_name: str) -> bytes:
     )
     qr.add_data(url)
     qr.make(fit=True)
-    # Classic black on white
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
     label_height = 80
@@ -242,7 +336,6 @@ def generate_qr_code(url: str, trolley_name: str) -> bytes:
         font_big = ImageFont.load_default()
         font_small = font_big
 
-    # Draw black top border line
     draw.rectangle([(0, qr_img.height), (qr_img.width, qr_img.height + 2)], fill="#111")
 
     text = f"TROLLEY: {trolley_name.upper()}"
@@ -334,97 +427,111 @@ def read_uploaded_excel(uploaded_file) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════════════
 # MOBILE SCAN VIEW — shown when ?trolley=NAME is in URL
 # ════════════════════════════════════════════════════════════════════════════════
-if scanned_trolley and scanned_trolley in st.session_state.trolleys:
-    st.markdown(MOBILE_CSS, unsafe_allow_html=True)
+if scanned_trolley:
+    # Always try to load fresh from Sheets (in case session was reset)
+    if scanned_trolley not in st.session_state.trolleys:
+        with st.spinner("🔄 Loading from Google Sheets..."):
+            st.session_state.trolleys = load_all_trolleys_from_sheets()
 
-    df = st.session_state.trolleys[scanned_trolley]["df"]
-    total_qty = int(df["Qty"].sum()) if "Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Qty"]) else "–"
-    pending_qty = int(df["Pending Qty"].sum()) if "Pending Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Pending Qty"]) else "–"
-    pick_qty = int(df["Pick Qty"].sum()) if "Pick Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Pick Qty"]) else "–"
+    if scanned_trolley in st.session_state.trolleys:
+        st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div class="phone-wrap">
-        <div class="phone-header">
-            <h1>🏭 PICK LIST</h1>
-            <div class="sub">TROLLEY: {scanned_trolley}</div>
-        </div>
-        <div class="stats-strip">
-            <div class="stat"><div class="stat-n">{len(df)}</div><div class="stat-l">Parts</div></div>
-            <div class="stat"><div class="stat-n">{total_qty}</div><div class="stat-l">Total Qty</div></div>
-            <div class="stat"><div class="stat-n">{pick_qty}</div><div class="stat-l">Pick Qty</div></div>
-            <div class="stat"><div class="stat-n">{pending_qty}</div><div class="stat-l">Pending</div></div>
-        </div>
-        <div class="section-label">Parts List · {len(df)} items</div>
-    """, unsafe_allow_html=True)
-
-    for i, row in df.iterrows():
-        part_no = row.get("Part No", "—")
-        desc = row.get("Description", "—")
-        qty = row.get("Qty", "—")
-        pick = row.get("Pick Qty", "—")
-        pending = row.get("Pending Qty", "—")
-        location = row.get("Picking Location (old Location)", "—")
-        trolley_loc = row.get("Trolley Location", "—")
-        zone = row.get("Zone", "—")
-        rack = row.get("Rack", "—")
-        family = row.get("Family", "—")
-        delivery = row.get("Delivery Location", "—")
-
-        try:
-            pending_int = int(pending)
-            pending_class = "pending-ok" if pending_int == 0 else "pending-warn"
-            pending_icon = "✓ All picked" if pending_int == 0 else f"⚠ {pending_int} pending"
-        except (ValueError, TypeError):
-            pending_class = "pending-warn"
-            pending_icon = f"{pending} pending"
+        df = st.session_state.trolleys[scanned_trolley]["df"]
+        total_qty = int(df["Qty"].sum()) if "Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Qty"]) else "–"
+        pending_qty = int(df["Pending Qty"].sum()) if "Pending Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Pending Qty"]) else "–"
+        pick_qty = int(df["Pick Qty"].sum()) if "Pick Qty" in df.columns and pd.api.types.is_numeric_dtype(df["Pick Qty"]) else "–"
 
         st.markdown(f"""
-        <div class="part-card">
-            <div class="part-top">
-                <div>
-                    <span class="part-no">{part_no}</span>
-                    <div class="part-desc">{desc}</div>
-                </div>
-                <div class="qty-block">
-                    <div class="qty-big">{qty}</div>
-                    <div class="qty-label">QTY</div>
-                    <div class="{pending_class}">{pending_icon}</div>
-                </div>
+        <div class="phone-wrap">
+            <div class="phone-header">
+                <h1>🏭 PICK LIST</h1>
+                <div class="sub">TROLLEY: {scanned_trolley}</div>
             </div>
-            <div class="tags">
-                <span class="tag">📍 {location}</span>
-                <span class="tag">🛒 {trolley_loc}</span>
-                <span class="tag">Zone: {zone}</span>
-                <span class="tag">Rack: {rack}</span>
-                <span class="tag">Pick: {pick}</span>
-                {'<span class="tag">📦 ' + str(family) + '</span>' if str(family) not in ['—','nan',''] else ''}
-                {'<span class="tag">🚚 ' + str(delivery) + '</span>' if str(delivery) not in ['—','nan',''] else ''}
+            <div class="stats-strip">
+                <div class="stat"><div class="stat-n">{len(df)}</div><div class="stat-l">Parts</div></div>
+                <div class="stat"><div class="stat-n">{total_qty}</div><div class="stat-l">Total Qty</div></div>
+                <div class="stat"><div class="stat-n">{pick_qty}</div><div class="stat-l">Pick Qty</div></div>
+                <div class="stat"><div class="stat-n">{pending_qty}</div><div class="stat-l">Pending</div></div>
             </div>
-        </div>
+            <div class="section-label">Parts List · {len(df)} items</div>
         """, unsafe_allow_html=True)
 
-    st.markdown('<div class="footer">🏭 Trolley QR Manager · Scan complete</div></div>', unsafe_allow_html=True)
+        for i, row in df.iterrows():
+            part_no = row.get("Part No", "—")
+            desc = row.get("Description", "—")
+            qty = row.get("Qty", "—")
+            pick = row.get("Pick Qty", "—")
+            pending = row.get("Pending Qty", "—")
+            location = row.get("Picking Location (old Location)", "—")
+            trolley_loc = row.get("Trolley Location", "—")
+            zone = row.get("Zone", "—")
+            rack = row.get("Rack", "—")
+            family = row.get("Family", "—")
+            delivery = row.get("Delivery Location", "—")
 
-    excel_bytes = df_to_styled_excel(df, scanned_trolley)
-    st.download_button(
-        label="⬇️ Download Pick List as Excel",
-        data=excel_bytes,
-        file_name=f"PickList_{scanned_trolley}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.stop()
+            try:
+                pending_int = int(pending)
+                pending_class = "pending-ok" if pending_int == 0 else "pending-warn"
+                pending_icon = "✓ All picked" if pending_int == 0 else f"⚠ {pending_int} pending"
+            except (ValueError, TypeError):
+                pending_class = "pending-warn"
+                pending_icon = f"{pending} pending"
 
-elif scanned_trolley:
-    # Trolley not found in session (happens when deployed — need persistent storage)
-    st.warning(f"⚠️ Trolley **{scanned_trolley}** not found in current session.")
-    st.info("💡 **Deployment Note:** For QR scanning to work across sessions, connect a database (Google Sheets, Firebase, Supabase, etc.) so data persists. In local mode, the admin must keep the app open.")
-    st.stop()
+            st.markdown(f"""
+            <div class="part-card">
+                <div class="part-top">
+                    <div>
+                        <span class="part-no">{part_no}</span>
+                        <div class="part-desc">{desc}</div>
+                    </div>
+                    <div class="qty-block">
+                        <div class="qty-big">{qty}</div>
+                        <div class="qty-label">QTY</div>
+                        <div class="{pending_class}">{pending_icon}</div>
+                    </div>
+                </div>
+                <div class="tags">
+                    <span class="tag">📍 {location}</span>
+                    <span class="tag">🛒 {trolley_loc}</span>
+                    <span class="tag">Zone: {zone}</span>
+                    <span class="tag">Rack: {rack}</span>
+                    <span class="tag">Pick: {pick}</span>
+                    {'<span class="tag">📦 ' + str(family) + '</span>' if str(family) not in ['—','nan',''] else ''}
+                    {'<span class="tag">🚚 ' + str(delivery) + '</span>' if str(delivery) not in ['—','nan',''] else ''}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown('<div class="footer">🏭 Trolley QR Manager · Scan complete</div></div>', unsafe_allow_html=True)
+
+        excel_bytes = df_to_styled_excel(df, scanned_trolley)
+        st.download_button(
+            label="⬇️ Download Pick List as Excel",
+            data=excel_bytes,
+            file_name=f"PickList_{scanned_trolley}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.stop()
+
+    else:
+        st.error(f"❌ Trolley **{scanned_trolley}** not found in Google Sheets.")
+        st.info("Ask the admin to register this trolley and ensure Google Sheets is connected.")
+        st.stop()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN ADMIN UI
 # ════════════════════════════════════════════════════════════════════════════════
 st.markdown(MAIN_CSS, unsafe_allow_html=True)
+
+# Google Sheets status banner
+if st.session_state.sheets_ok:
+    st.success("✅ Google Sheets connected — data persists across sessions and QR scans will always work.")
+else:
+    st.error(
+        "❌ Google Sheets NOT connected. Workers scanning QR codes will see 'not found'. "
+        "Add your service account credentials to **Streamlit Secrets** (see sidebar for instructions)."
+    )
 
 # Header
 st.markdown("""
@@ -492,11 +599,19 @@ with tab1:
                 extras = [c for c in df.columns if c not in EXPECTED_COLS]
                 df = df[ordered + extras]
 
+                # Save to Google Sheets first
+                with st.spinner(f"💾 Saving {trolley_name} to Google Sheets..."):
+                    saved = save_trolley_to_sheets(trolley_name, df)
+
                 st.session_state.trolleys[trolley_name] = {
                     "df": df,
                     "filename": uploaded_file.name
                 }
-                st.success(f"✅ Trolley **{trolley_name}** registered with {len(df)} parts!")
+
+                if saved:
+                    st.success(f"✅ Trolley **{trolley_name}** registered with {len(df)} parts and saved to Google Sheets!")
+                else:
+                    st.warning(f"⚠️ Trolley **{trolley_name}** saved in session only (Google Sheets not configured).")
                 st.rerun()
 
         if st.session_state.trolleys:
@@ -516,6 +631,7 @@ with tab1:
                     """, unsafe_allow_html=True)
                 with row_c2:
                     if st.button("🗑️", key=f"del_{name}", help=f"Remove {name}"):
+                        delete_trolley_from_sheets(name)
                         del st.session_state.trolleys[name]
                         st.rerun()
 
@@ -583,6 +699,13 @@ with tab1:
 with tab2:
     st.markdown('<div class="section-title">All Pick Lists</div>', unsafe_allow_html=True)
 
+    col_r1, col_r2 = st.columns([3, 1])
+    with col_r2:
+        if st.button("🔄 Refresh from Google Sheets", use_container_width=True):
+            with st.spinner("Loading..."):
+                st.session_state.trolleys = load_all_trolleys_from_sheets()
+            st.rerun()
+
     if not st.session_state.trolleys:
         st.info("ℹ️ No trolleys registered yet.")
     else:
@@ -612,7 +735,7 @@ with tab2:
 # ── TAB 3 ─────────────────────────────────────────────────────────────────────
 with tab3:
     st.markdown('<div class="section-title">📱 Scan Simulator — What Workers See on Phone</div>', unsafe_allow_html=True)
-    st.caption("Click the link below to simulate opening the scanned URL. This is exactly what a worker's phone browser shows.")
+    st.caption("Click the link below to simulate opening the scanned URL.")
 
     if not st.session_state.trolleys:
         st.info("ℹ️ Register trolleys first.")
@@ -625,16 +748,11 @@ with tab3:
 
         if sim_trolley:
             url = build_qr_url(sim_trolley)
-            st.markdown(f"""
-            <div class="url-box">🔗 {url}</div>
-            """, unsafe_allow_html=True)
+            st.markdown(f'<div class="url-box">🔗 {url}</div>', unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
-
-            # Open the scan view in same tab
             st.link_button(f"📱 Open Scan View for {sim_trolley}", url, use_container_width=True)
-
             st.markdown("---")
-            st.info("👆 Click above to see exactly what workers see when they scan the QR code. The pick list opens as a clean mobile-friendly page.")
+            st.info("👆 Click above to see exactly what workers see when they scan the QR code.")
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -651,7 +769,7 @@ with st.sidebar:
         ("2", "Name Trolley", "Enter the trolley ID (e.g. TROLLEY-A)."),
         ("3", "Generate QR", "Click Register. A black & white QR code is created."),
         ("4", "Download & Print", "Download the QR PNG and paste on the physical trolley."),
-        ("5", "Worker Scans", "Worker scans with phone → pick list opens in browser, no app needed."),
+        ("5", "Worker Scans", "Worker scans with phone → pick list opens from Google Sheets, always fresh."),
     ]
 
     for num, title, desc in steps:
@@ -668,16 +786,63 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.markdown("---")
+
+    # ── Google Sheets Setup Instructions ──────────────────────────────────────
     st.markdown("""
-    <div style="font-size:0.75rem; color:#888; font-family:'DM Mono',monospace; line-height:1.7;
-                background:#F0F0EA; border-radius:6px; padding:12px;">
-        <strong style="color:#444;">⚠️ Persistent Storage</strong><br>
-        On Streamlit Cloud, data resets between sessions.<br>
-        For production, connect a database so QR scan data persists even after app restarts.
+    <div style="font-family:'DM Sans',sans-serif; font-size:0.9rem; font-weight:700;
+                color:#111; margin-bottom:10px;">
+        🔧 Google Sheets Setup
     </div>
     """, unsafe_allow_html=True)
 
+    with st.expander("Step-by-step instructions", expanded=not st.session_state.sheets_ok):
+        st.markdown("""
+**1. Create a Google Cloud Project**
+- Go to [console.cloud.google.com](https://console.cloud.google.com)
+- Create a new project
+
+**2. Enable APIs**
+- Enable **Google Sheets API**
+- Enable **Google Drive API**
+
+**3. Create Service Account**
+- IAM & Admin → Service Accounts → Create
+- Role: **Editor**
+- Create JSON key → download it
+
+**4. Share your Google Sheet**
+- Create a Google Sheet named `TrolleyQRManager`
+- Share it with the service account email (`...@....iam.gserviceaccount.com`) with **Editor** access
+
+**5. Add to Streamlit Secrets**
+In your app dashboard → Settings → Secrets, paste:
+
+```toml
+spreadsheet_name = "TrolleyQRManager"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "key-id"
+private_key = "-----BEGIN RSA PRIVATE KEY-----\\nYOUR KEY\\n-----END RSA PRIVATE KEY-----\\n"
+client_email = "name@project.iam.gserviceaccount.com"
+client_id = "123456789"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
+```
+
+**6. Add to requirements.txt**
+```
+gspread
+google-auth
+```
+        """)
+
     st.markdown("---")
     if st.session_state.trolleys and st.button("🗑️ Clear All Trolleys", use_container_width=True):
+        for name in list(st.session_state.trolleys.keys()):
+            delete_trolley_from_sheets(name)
         st.session_state.trolleys = {}
         st.rerun()
